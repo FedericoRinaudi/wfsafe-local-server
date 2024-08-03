@@ -13,10 +13,16 @@ impl Deref for Keys {
 
     fn deref(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts(
-                self as *const Keys as *const u8,
-                mem::size_of::<Keys>(),
-            )
+            std::slice::from_raw_parts(self as *const Keys as *const u8, mem::size_of::<Keys>())
+        }
+    }
+}
+
+impl Keys {
+    pub fn new(padding_key: [u8; 32], dummy_packet_key: [u8; 32]) -> Self {
+        Self {
+            padding_key,
+            dummy_packet_key,
         }
     }
 }

@@ -1,2 +1,3 @@
-pub(crate) mod program_manager;
-mod error;
+pub(crate) mod error;
+pub(crate) mod program;
+pub(crate )mod clients_map;

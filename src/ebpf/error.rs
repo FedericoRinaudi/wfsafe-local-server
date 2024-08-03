@@ -1,14 +1,13 @@
+use rocket::tokio::task::JoinError;
 use std::error;
 use std::fmt::{Display, Formatter};
-use rocket::tokio::task::JoinError;
 
 #[derive(Debug)]
 pub enum EbpfError {
     LibbpfError(libbpf_rs::Error),
     JoinError(JoinError),
     FigmentError(rocket::figment::Error),
-    Err(String)
-
+    Err(String),
 }
 
 impl From<libbpf_rs::Error> for EbpfError {
@@ -35,20 +34,18 @@ impl Display for EbpfError {
             EbpfError::LibbpfError(e) => write!(f, "LibbpfError: {}", e),
             EbpfError::JoinError(e) => write!(f, "JoinError: {}", e),
             EbpfError::FigmentError(e) => write!(f, "FigmentError: {}", e),
-            EbpfError::Err(e) => write!(f, "Error: {}", e)
+            EbpfError::Err(e) => write!(f, "Error: {}", e),
         }
     }
 }
 
 impl error::Error for EbpfError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-
         Some(match self {
             EbpfError::LibbpfError(e) => e,
             EbpfError::JoinError(e) => e,
             EbpfError::FigmentError(e) => e,
-            EbpfError::Err(_) => return None
-        }
-        )
+            EbpfError::Err(_) => return None,
+        })
     }
 }

@@ -1674,7 +1674,6 @@ dependencies = [
  "libbpf-cargo",
  "libbpf-rs",
  "libbpf-sys",
- "libc",
  "regex",
  "rlimit",
  "rocket",

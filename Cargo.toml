@@ -10,7 +10,6 @@ regex = "1.10.5"
 libbpf-rs = "0.23.3"
 libbpf-sys = "1.4.3+v1.4.5"
 libbpf-cargo = "0.23.3"
-libc = "0.2.155"
 rlimit = "0.10.1"
 
 

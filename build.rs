@@ -1,5 +1,5 @@
 use libbpf_cargo::SkeletonBuilder;
-use std::{path::PathBuf};
+use std::path::PathBuf;
 
 const SRC: &str = "src/ebpf/wfsafe.bpf.c";
 
@@ -19,9 +19,7 @@ fn main() {
 }*/
 
 fn main() {
-
-    let mut out =
-        PathBuf::from("src/ebpf");
+    let mut out = PathBuf::from("src/ebpf");
     out.push("wfsafe.skel.rs");
 
     SkeletonBuilder::new()

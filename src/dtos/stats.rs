@@ -9,9 +9,6 @@ pub struct StatsDTO {
 
 impl StatsDTO {
     pub fn new(avg: usize, var: usize) -> Self {
-        Self {
-            avg,
-            var,
-        }
+        Self { avg, var }
     }
 }

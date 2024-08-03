@@ -1,5 +1,5 @@
-use rocket::serde::Deserialize;
 use crate::impl_from_data;
+use rocket::serde::Deserialize;
 
 #[derive(Deserialize)]
 #[serde(crate = "rocket::serde")]
