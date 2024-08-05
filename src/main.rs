@@ -32,17 +32,21 @@ async fn stats(protocol_name: &str) -> Result<Accepted<Json<PacketStatsDTO>>, Ba
     ))))
 }
 
-#[post("/client", format = "json", data = "<client>")]
+#[post("/<protocol_name>/client", format = "json", data = "<client>")]
 async fn register_client(
+    protocol_name: &str,
     client: ClientDTO,
     clients_map: &State<Mutex<ClientsMap>>,
 
-) -> Result<Created<()>, BadRequest<String>> {
+) -> Result<Accepted<Json<PacketStatsDTO>>, BadRequest<String>> {
     let mut  clients_map = clients_map.lock().expect("Failed to lock mutex");
     ClientService::register_client(&mut clients_map, client).map_err(|e| {
         BadRequest(format!("Error registering client: {}", e))
     })?;
-    Ok(Created::new(""))
+    Ok(Accepted(Json(PacketStatsDTO::new(
+        StatsDTO::new(100, 10),
+        StatsDTO::new(20, 5),
+    ))))
 }
 
 #[delete("/client", format = "json", data = "<flow>")]

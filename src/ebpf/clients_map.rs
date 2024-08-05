@@ -49,5 +49,12 @@ unsafe impl Sync for ClientsMap {}
 impl Drop for ClientsMap {
     fn drop(&mut self) {
         self.link.detach().unwrap();
-    }
+        let map = self.object.map_mut(&self.map_name).ok_or(EbpfError::Err(format!("Map \"{}\" not found", &self.map_name))).unwrap();
+        let keys :Vec<Vec<u8>> = map.keys().into_iter().collect();
+        let count = keys.len() as u32;
+        if  count !=0 {
+            let batch: Vec<u8> = keys.into_iter().flatten().collect();
+            map.delete_batch(&batch, count, MapFlags::ANY, MapFlags::ANY).unwrap();
+        }
+        }
 }
