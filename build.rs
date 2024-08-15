@@ -1,3 +1,4 @@
+use std::env;
 use libbpf_cargo::SkeletonBuilder;
 use std::path::PathBuf;
 
@@ -19,7 +20,9 @@ fn main() {
 }*/
 
 fn main() {
-    let mut out = PathBuf::from("src/ebpf");
+    let mut out = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set in build script"),
+    ).join("src/ebpf");
     out.push("wfsafe.skel.rs");
 
     SkeletonBuilder::new()

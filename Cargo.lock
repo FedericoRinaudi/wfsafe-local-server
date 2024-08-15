@@ -1674,6 +1674,7 @@ dependencies = [
  "libbpf-cargo",
  "libbpf-rs",
  "libbpf-sys",
+ "num_cpus",
  "regex",
  "rlimit",
  "rocket",
