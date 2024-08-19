@@ -12,6 +12,7 @@ typedef struct {
 	__u32 datalen;
 	unsigned long long bitlen;
 	__u32 state[8];
+	__u32 m[SHA256_BLOCK_SIZE];
 } SHA256_CTX ;
 
 typedef struct {
