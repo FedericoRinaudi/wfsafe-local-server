@@ -40,20 +40,27 @@ struct
 	__type(value, HMAC_SHA256_CTX);
 } ctx_map SEC(".maps");
 
-
-typedef struct flow {
+typedef struct flow
+{
 	__be32 src_addr;
 	__be32 dst_addr;
 	__be16 src_port;
 	__be16 dst_port;
 } flow_t;
 
-typedef struct keys {
-    __u8 padding_key[KEY_SIZE];
-    __u8 dummy_packet_key[KEY_SIZE];
+typedef struct keys
+{
+	__u8 padding_key[KEY_SIZE];
+	__u8 dummy_packet_key[KEY_SIZE];
 } keys_t;
 
-struct {
+struct message
+{
+	__u8 message[MESSAGE_SIZE];
+};
+
+struct
+{
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
 	__type(key, flow_t);
@@ -76,12 +83,12 @@ static const __u32 k[SHA256_BLOCK_SIZE] = {
 static inline void sha256_transform(SHA256_CTX *ctx, const __u8 *data)
 {
 
-	__u32 a, b, c, d, e, f, g, h, i, j, t1, t2, m[SHA256_BLOCK_SIZE];
+	__u32 a, b, c, d, e, f, g, h, i, j, t1, t2;
 
 	for (i = 0, j = 0; i < 16; ++i, j += 4)
-		m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | (data[j + 3]);
+		ctx->m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | (data[j + 3]);
 	for (; i < SHA256_BLOCK_SIZE; ++i)
-		m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
+		ctx->m[i] = SIG1(ctx->m[i - 2]) + ctx->m[i - 7] + SIG0(ctx->m[i - 15]) + ctx->m[i - 16];
 
 	a = ctx->state[0];
 	b = ctx->state[1];
@@ -94,7 +101,7 @@ static inline void sha256_transform(SHA256_CTX *ctx, const __u8 *data)
 
 	for (i = 0; i < SHA256_BLOCK_SIZE; ++i)
 	{
-		t1 = h + EP1(e) + CH(e, f, g) + k[i] + m[i];
+		t1 = h + EP1(e) + CH(e, f, g) + k[i] + ctx->m[i];
 		t2 = EP0(a) + MAJ(a, b, c);
 		h = g;
 		g = f;
@@ -140,10 +147,7 @@ static inline void sha256_update(SHA256_CTX *ctx, const __u8 *x, const __u8 *y)
 	ctx->bitlen += 512;
 	memcpy(ctx->data, y, MESSAGE_SIZE);
 	ctx->datalen = MESSAGE_SIZE;
-
 }
-
-
 
 static inline void sha256_final(SHA256_CTX *ctx, __u8 hash[])
 {
@@ -181,7 +185,7 @@ static inline void sha256_final(SHA256_CTX *ctx, __u8 hash[])
 static inline void hmac_sha256(
 	HMAC_SHA256_CTX *ctx,
 	const __u8 *key,
-	const void *data,
+	const void *message,
 	__u8 *out,
 	const size_t outlen)
 {
@@ -202,28 +206,24 @@ static inline void hmac_sha256(
 	// Perform HMAC algorithm: ( https://tools.ietf.org/html/rfc2104 )
 	//      `H(K XOR opad, H(K XOR ipad, data))`
 	sha256_init(sha_ctx);
-	sha256_update(sha_ctx, ctx->k_ipad, data);
+	sha256_update(sha_ctx, ctx->k_ipad, message);
 	sha256_final(sha_ctx, ctx->ihash);
-	
-	
+
 	sha256_init(sha_ctx);
 	sha256_update(sha_ctx, ctx->k_opad, ctx->ihash);
 	sha256_final(sha_ctx, ctx->ohash);
-
 
 	sz = (outlen > SHA256_DIGEST_SIZE) ? SHA256_DIGEST_SIZE : outlen;
 
 	memcpy(out, ctx->ohash, sz);
 }
 
-
-
 static inline int ip_is_fragment(struct iphdr *iph)
 {
 	return bpf_ntohs(iph->frag_off) & (IP_MF | IP_OFFSET);
 }
 
-static inline void* manage_ethernet(void* data, void* data_end)
+static inline void *manage_ethernet(void *data, void *data_end)
 {
 	struct ethhdr *eth = data;
 
@@ -232,7 +232,7 @@ static inline void* manage_ethernet(void* data, void* data_end)
 		return NULL;
 	}
 
-	if(bpf_htons(eth->h_proto) != ETH_P_IP)
+	if (bpf_htons(eth->h_proto) != ETH_P_IP)
 	{
 		return NULL;
 	}
@@ -240,13 +240,11 @@ static inline void* manage_ethernet(void* data, void* data_end)
 	return data + ETH_HLEN;
 }
 
-
-
-static inline void* manage_ipv4(void* data, void* data_end, flow_t *fl)
+static inline void *manage_ipv4(void *data, void *data_end, flow_t *fl)
 {
 
 	__u8 ip_len;
-	struct iphdr *ip_v4 = (struct iphdr *) data;
+	struct iphdr *ip_v4 = (struct iphdr *)data;
 
 	if (data + IPV4_MIN_HLEN > data_end)
 	{
@@ -267,19 +265,22 @@ static inline void* manage_ipv4(void* data, void* data_end, flow_t *fl)
 
 	if (ip_v4->protocol != IPPROTO_TCP)
 	{
-		bpf_printk("No TCP packet\n");
+		// bpf_printk("No TCP packet\n");
 		return NULL;
 	}
 
 	fl->src_addr = bpf_ntohl(ip_v4->saddr);
 	fl->dst_addr = bpf_ntohl(ip_v4->daddr);
 
-	return (void*) ((long)data + (long)ip_len);
+	//bpf_printk("IP src: %u\n", fl->src_addr);
+	//bpf_printk("IP dst: %u\n", fl->dst_addr);
+
+	return (void *)((long)data + (long)ip_len);
 }
 
-static inline __u8 manage_tcp(void* data, void* data_end, flow_t *fl)
+static inline __u8 manage_tcp(void *data, void *data_end, flow_t *fl)
 {
-	struct tcphdr *tcp = (struct tcphdr *) data;
+	struct tcphdr *tcp = (struct tcphdr *)data;
 	__u16 tcp_hlen;
 
 	if (data + TCP_MIN_HLEN > data_end)
@@ -287,99 +288,172 @@ static inline __u8 manage_tcp(void* data, void* data_end, flow_t *fl)
 
 	fl->src_port = bpf_ntohs(tcp->source);
 	fl->dst_port = bpf_ntohs(tcp->dest);
+	//bpf_printk("TCP src port: %d\n", fl->src_port);
+	//bpf_printk("TCP dst port: %d\n", fl->dst_port);
 
 	return 1;
-	//return data + tcp_hlen;
+	// return data + tcp_hlen;
+}
+
+static inline int ptr_at(struct xdp_md *ctx, size_t offset, size_t len, void **out) {
+    void *start = (void *)(long)ctx->data;
+	void *end = (void *)(long)ctx->data_end;
+
+    if (start + offset + len > end) {
+        return -1; // Errore
+    }
+
+    *out = (void *)(start + offset);
+    return 0; // Successo
+}
+
+static inline void* ptr_at_1(struct xdp_md *ctx, size_t offset, size_t len) {
+	void *out;
+    void *start = (__u8*) ctx->data;
+	void *end = (__u8*) ctx->data_end;
+
+    if (start + offset + len > end) {
+        return NULL; // Errore
+    }
+	
+    out = (void *)(start + offset);
+    return out; // Successo
 }
 
 __attribute__((no_stack_protector))
-SEC("xdp")
-int  xdp_parser_func(struct xdp_md *ctx)
+SEC("xdp") int xdp_parser_func(struct xdp_md *ctx)
 {
-	void *data_end = (void *) (long) ctx->data_end;
-	void *data = (void*) (long)ctx->data;
-    __u8 hmac[SHA256_DIGEST_SIZE];
-    HMAC_SHA256_CTX *hmac_ctx;
+	void *data_end = (void *)(long)ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+	__u8 hmac[SHA256_DIGEST_SIZE];
+	HMAC_SHA256_CTX *hmac_ctx;
 	struct so_event *e;
 	keys_t *keys;
 	struct flow fl;
-    __u32 packet_len;
+	__u32 packet_len;
 	int hmac_message_offset;
 	__u32 dummy_hmac_offset;
+	__u32 ctx_map_key = 0;
+	struct message *hmac_message;
+	struct message hmac_message_copy;
 
-	//l2 management
+	// l2 management
 	data = manage_ethernet(data, data_end);
 	if (!data)
 		return XDP_PASS;
 
-	//l3 management
+	// l3 management
 	data = manage_ipv4(data, data_end, &fl);
-	if(!data)
+	if (!data)
 		return XDP_PASS;
 
-	//l4 management
-	if(!manage_tcp(data, data_end, &fl))
+	// l4 management
+	if (!manage_tcp(data, data_end, &fl))
 		return XDP_PASS;
 
-	//retrieve secret key
+	// bpf_printk("tcp packet");
+	// retrieve secret key
 	keys = bpf_map_lookup_elem(&clients_map, &fl);
 
-	//check if ip is registered
+	// check if ip is registered
 	if (!keys)
 	{
-		//bpf_printk("IP not registered\n");
-    	return XDP_PASS;
+		// bpf_printk("IP not registered\n");
+		return XDP_PASS;
 	}
 
-	hmac_ctx = bpf_map_lookup_elem(&ctx_map, &fl);
+	bpf_printk("client registered");
+
+	hmac_ctx = bpf_map_lookup_elem(&ctx_map, &ctx_map_key);
 	if (!hmac_ctx)
 	{
+		bpf_printk("HMAC context not found\n");
 		return XDP_PASS;
 	}
 
 	packet_len = ctx->data_end - ctx->data;
-
-	/*if(packet_len < MESSAGE_SIZE + SHA256_DIGEST_SIZE)
-	{
-		return XDP_PASS;
-	}*/
-
-	hmac_message_offset = packet_len - (MESSAGE_SIZE + SHA256_DIGEST_SIZE);
+	//bpf_printk("ctx->data: %u", ctx->data);
+	//bpf_printk("ctx->data_end: %u", ctx->data_end);
+	data = (void *)(long)ctx->data;
 	
+	hmac_message_offset = packet_len - (MESSAGE_SIZE + SHA256_DIGEST_SIZE);
 
-	data = (void*) (long)ctx->data;
-
-	data = (void*)((long) data + (long)hmac_message_offset);
-
-	//
-	if(data + MESSAGE_SIZE > data_end || hmac_message_offset < 0)
+	if(hmac_message_offset < 0)
 	{
-		return XDP_PASS;
-	}
-	{
-		return XDP_PASS;
-	}	
-
-
-    hmac_sha256(hmac_ctx, keys->dummy_packet_key, data, hmac, SHA256_DIGEST_SIZE);
-
-
-    data += SHA256_DIGEST_SIZE;
-
-   	if(data + SHA256_DIGEST_SIZE > data_end)
-	{
+		bpf_printk("hmac_message_offset < 0");
 		return XDP_PASS;
 	}
 
+	bpf_printk("hmac_message_offset_1: %d", hmac_message_offset);
 
-    if (memcmp(hmac, data, SHA256_DIGEST_SIZE) == 0)
-    {
-        return XDP_DROP;
-    }
+	hmac_message_offset = hmac_message_offset & 0xFFF;
 
-    
+	bpf_printk("packet_len: %u", packet_len);
+	//bpf_printk("data: %x", data);
+	//bpf_printk("hmac_message_offset: %x", hmac_message_offset);
+	//void* start = (void *)(long)data;
+
+	data = (void *)((long)data + (long)hmac_message_offset);
+
+	if (data + MESSAGE_SIZE > data_end)
+	{
+	    bpf_printk("data + MESSAGE_SIZE > data_end");
+		return XDP_PASS;
+	}
+	
+	/*
+	#pragma unroll
+	for (int i = 0; i < MESSAGE_SIZE; i++)
+	{
+		data = ptr_at_1(ctx, hmac_message_offset, i);
+		if (!data)
+		{
+			return XDP_PASS;
+		}
+		hmac_message[i] = ((__u8 *)data)[i];
+	}
+	
+	data = ptr_at_1(ctx, hmac_message_offset, MESSAGE_SIZE);
+	if (!data)
+	{
+		return XDP_PASS;
+	}
+
+
+	hmac_message = data;
+
+	if(data + sizeof(struct message) > data_end)
+	{
+		return XDP_PASS;
+	}
+	*/
+	//memcpy(&hmac_message_copy, hmac_message, MESSAGE_SIZE);
+
+	hmac_sha256(hmac_ctx, keys->dummy_packet_key, data, hmac, SHA256_DIGEST_SIZE);
+
+
+	data += MESSAGE_SIZE;
+
+	if (data + SHA256_DIGEST_SIZE > data_end)
+	{
+		bpf_printk("data + SHA256_DIGEST_SIZE > data_end");
+		return XDP_PASS;
+	}
+
+	
+	bpf_printk("hmac: ");
+	bpf_printk("%x%x%x%x%x%x%x%x%x%x", hmac[0], hmac[1], hmac[2], hmac[3], hmac[4], hmac[5], hmac[6], hmac[7], hmac[8], hmac[9]);
+	bpf_printk("%x%x%x%x%x%x%x%x%x%x", hmac[10], hmac[11], hmac[12], hmac[13], hmac[14], hmac[15], hmac[16], hmac[17], hmac[18], hmac[19]);
+	bpf_printk("%x%x%x%x%x%x%x%x%x%x", hmac[20], hmac[21], hmac[22], hmac[23], hmac[24], hmac[25], hmac[26], hmac[27], hmac[28], hmac[29]);
+	bpf_printk("%x%x%x%x%x%x%x%x%x%x", hmac[30], hmac[31]);
+	
+	if (memcmp(hmac, data, SHA256_DIGEST_SIZE) == 0)
+	{
+		bpf_printk("droppng");
+		return XDP_DROP;
+	}
+	
 	return XDP_PASS;
 }
-
 
 char __license[] SEC("license") = "GPL";
