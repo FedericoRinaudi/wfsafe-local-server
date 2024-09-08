@@ -26,7 +26,7 @@ impl EbpfProgram {
 
 
         let mut prog = skel.progs_mut();
-        let link = prog.xdp_parser_func().attach_xdp(1)?;
+        let link = prog.xdp_parser_func().attach_xdp(3)?;
 
         let map_name = skel.maps().clients_map().name().to_string();
         let object = skel.obj;
