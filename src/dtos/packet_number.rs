@@ -4,7 +4,7 @@ use rocket::serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(crate = "rocket::serde")]
 pub(crate) struct NumberOfPacketsDTO {
-    number: usize,
+    pub number: usize,
 }
 
 fn validate_number_of_packets(number_of_packets: &NumberOfPacketsDTO) -> Result<(), String> {

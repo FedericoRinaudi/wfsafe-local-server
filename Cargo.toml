@@ -12,6 +12,13 @@ libbpf-sys = "1.4.3+v1.4.5"
 libbpf-cargo = "0.23.3"
 rlimit = "0.10.1"
 num_cpus = "1.16.0"
+diesel = "2.1.6"
+diesel-async = { version = "0.4.1", features = ["postgres"] }
 
 [build-dependencies]
 libbpf-cargo = "0.23"
+
+[dependencies.rocket_db_pools]
+version = "0.2.0"
+features = ["diesel_postgres"]
+

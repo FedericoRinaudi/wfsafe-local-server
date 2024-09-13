@@ -1,1 +1,2 @@
-[default-database]
+[default.databases.db]
+url = "postgres://user:password@localhost:8001/db"

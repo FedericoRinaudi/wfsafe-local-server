@@ -4,7 +4,7 @@ use rocket::serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(crate = "rocket::serde")]
 pub struct PacketSizeDTO {
-    size: usize,
+    pub(crate) size: usize,
 }
 
 fn validate_packet_size(packet_size: &PacketSizeDTO) -> Result<(), String> {

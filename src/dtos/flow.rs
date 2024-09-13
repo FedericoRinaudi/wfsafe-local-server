@@ -1,7 +1,7 @@
 use crate::dtos::utilities::validate_ip;
 use crate::entities::flow::Flow;
-use crate::parse_ip_to_u32;
 use crate::impl_from_data;
+use crate::parse_ip_to_u32;
 use rocket::serde::Deserialize;
 use std::net::Ipv4Addr;
 

@@ -2,42 +2,22 @@
 /* Copyright (c) 2020 Facebook */
 
 #include "vmlinux.h"
-#include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 #include <string.h>
 #include <bpf/bpf_endian.h>
-#include "wfsafe.h"
+#include "mem.h"
+#include "hmac.h"
+#include "header_parser.h"
 
-#define ETH_HLEN 14
-#define ETH_P_IP 0x0800
-#define IPV4_MIN_HLEN 20
-#define IP_MF 0x2000
-#define IP_OFFSET 0x1FFF
-#define TCP_MIN_HLEN 20
-#define MESSAGE_SIZE 32
-#define KEY_SIZE 32
-
-#define memset(dest, c, n) __builtin_memset((dest), (c), (n))
-#define memcpy(dest, src, n) __builtin_memcpy((dest), (src), (n))
-#define memcmp(dest, src, n) __builtin_memcmp((dest), (src), (n))
-
-/****************************** MACROS ******************************/
-#define ROTLEFT(a, b) (((a) << (b)) | ((a) >> (32 - (b))))
-#define ROTRIGHT(a, b) (((a) >> (b)) | ((a) << (32 - (b))))
-
-#define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-#define EP0(x) (ROTRIGHT(x, 2) ^ ROTRIGHT(x, 13) ^ ROTRIGHT(x, 22))
-#define EP1(x) (ROTRIGHT(x, 6) ^ ROTRIGHT(x, 11) ^ ROTRIGHT(x, 25))
-#define SIG0(x) (ROTRIGHT(x, 7) ^ ROTRIGHT(x, 18) ^ ((x) >> 3))
-#define SIG1(x) (ROTRIGHT(x, 17) ^ ROTRIGHT(x, 19) ^ ((x) >> 10))
+#define MAX_IPH_SIZE 60
+#define MAX_ALLOWED_SIZE 1442
 
 struct
 {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, HMAC_SHA256_CTX);
+	__type(value, hmac_sha256_ctx);
 } ctx_map SEC(".maps");
 
 typedef struct flow
@@ -54,9 +34,19 @@ typedef struct keys
 	__u8 dummy_packet_key[KEY_SIZE];
 } keys_t;
 
-struct message
+struct tlshdr
 {
-	__u8 message[MESSAGE_SIZE];
+	__u8 type;
+	__be16 version;
+	__be16 length;
+} __attribute__((packed));
+
+struct hdr
+{
+	struct ethhdr *eth;
+	struct iphdr *ip;
+	struct tcphdr *tcp;
+	struct tlshdr *tls;
 };
 
 struct
@@ -68,182 +58,39 @@ struct
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } clients_map SEC(".maps");
 
-/**************************** VARIABLES *****************************/
-static const __u32 k[SHA256_BLOCK_SIZE] = {
-	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-
-/*********************** FUNCTION DEFINITIONS ***********************/
-static inline void sha256_transform(SHA256_CTX *ctx, const __u8 *data)
+static __always_inline __u16 csum_fold(__u32 csum)
 {
-
-	__u32 a, b, c, d, e, f, g, h, i, j, t1, t2;
-
-	for (i = 0, j = 0; i < 16; ++i, j += 4)
-		ctx->m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | (data[j + 3]);
-	for (; i < SHA256_BLOCK_SIZE; ++i)
-		ctx->m[i] = SIG1(ctx->m[i - 2]) + ctx->m[i - 7] + SIG0(ctx->m[i - 15]) + ctx->m[i - 16];
-
-	a = ctx->state[0];
-	b = ctx->state[1];
-	c = ctx->state[2];
-	d = ctx->state[3];
-	e = ctx->state[4];
-	f = ctx->state[5];
-	g = ctx->state[6];
-	h = ctx->state[7];
-
-	for (i = 0; i < SHA256_BLOCK_SIZE; ++i)
-	{
-		t1 = h + EP1(e) + CH(e, f, g) + k[i] + ctx->m[i];
-		t2 = EP0(a) + MAJ(a, b, c);
-		h = g;
-		g = f;
-		f = e;
-		e = d + t1;
-		d = c;
-		c = b;
-		b = a;
-		a = t1 + t2;
-	}
-
-	ctx->state[0] += a;
-	ctx->state[1] += b;
-	ctx->state[2] += c;
-	ctx->state[3] += d;
-	ctx->state[4] += e;
-	ctx->state[5] += f;
-	ctx->state[6] += g;
-	ctx->state[7] += h;
+	csum = (csum & 0xffff) + (csum >> 16);
+	csum = (csum & 0xffff) + (csum >> 16);
+	return (__u16)~csum;
 }
 
-static inline void sha256_init(SHA256_CTX *ctx)
+static __always_inline __u16 csum_tcpudp_magic(__u32 saddr, __u32 daddr,
+											   __u32 len, __u8 proto,
+											   __u32 csum)
 {
-	ctx->datalen = 0;
-	ctx->bitlen = 0;
-	ctx->state[0] = 0x6a09e667;
-	ctx->state[1] = 0xbb67ae85;
-	ctx->state[2] = 0x3c6ef372;
-	ctx->state[3] = 0xa54ff53a;
-	ctx->state[4] = 0x510e527f;
-	ctx->state[5] = 0x9b05688c;
-	ctx->state[6] = 0x1f83d9ab;
-	ctx->state[7] = 0x5be0cd19;
+	__u64 s = csum;
+
+	s += (__u32)saddr;
+	s += (__u32)daddr;
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	s += proto + len;
+#elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	s += (proto + len) << 8;
+#else
+#error Unknown endian
+#endif
+	s = (s & 0xffffffff) + (s >> 32);
+	s = (s & 0xffffffff) + (s >> 32);
+
+	return csum_fold((__u32)s);
 }
 
-// static inline void sha256_update(SHA256_CTX *ctx, const __u8 *x, size_t xlen, const __u8 *y, size_t ylen)
-static inline void sha256_update(SHA256_CTX *ctx, const __u8 *x, const __u8 *y)
-{
-	size_t i;
-
-	memcpy(ctx->data, x, SHA256_BLOCK_SIZE);
-	sha256_transform(ctx, ctx->data);
-	ctx->bitlen += 512;
-	memcpy(ctx->data, y, MESSAGE_SIZE);
-	ctx->datalen = MESSAGE_SIZE;
-}
-
-static inline void sha256_final(SHA256_CTX *ctx, __u8 hash[])
+/*
+static __always_inline void *manage_ipv4_checksums(void *data, void *data_end, __u16 cut_len)
 {
 
-	ctx->data[MESSAGE_SIZE] = 0x80;
-	memset(ctx->data + MESSAGE_SIZE + 1, 0, 56 - MESSAGE_SIZE - 1);
-
-	// Append to the padding the total message's length in bits and transform.
-	ctx->bitlen += ctx->datalen * 8;
-	ctx->data[63] = ctx->bitlen;
-	ctx->data[62] = ctx->bitlen >> 8;
-	ctx->data[61] = ctx->bitlen >> 16;
-	ctx->data[60] = ctx->bitlen >> 24;
-	ctx->data[59] = ctx->bitlen >> 32;
-	ctx->data[58] = ctx->bitlen >> 40;
-	ctx->data[57] = ctx->bitlen >> 48;
-	ctx->data[56] = ctx->bitlen >> 56;
-	sha256_transform(ctx, ctx->data);
-
-	// Since this implementation uses little endian byte ordering and SHA uses big endian,
-	// reverse all the bytes when copying the final state to the output hash.
-	for (__u8 i = 0; i < 4; ++i)
-	{
-		hash[i] = (ctx->state[0] >> (24 - i * 8)) & 0x000000ff;
-		hash[i + 4] = (ctx->state[1] >> (24 - i * 8)) & 0x000000ff;
-		hash[i + 8] = (ctx->state[2] >> (24 - i * 8)) & 0x000000ff;
-		hash[i + 12] = (ctx->state[3] >> (24 - i * 8)) & 0x000000ff;
-		hash[i + 16] = (ctx->state[4] >> (24 - i * 8)) & 0x000000ff;
-		hash[i + 20] = (ctx->state[5] >> (24 - i * 8)) & 0x000000ff;
-		hash[i + 24] = (ctx->state[6] >> (24 - i * 8)) & 0x000000ff;
-		hash[i + 28] = (ctx->state[7] >> (24 - i * 8)) & 0x000000ff;
-	}
-}
-
-static inline void hmac_sha256(
-	HMAC_SHA256_CTX *ctx,
-	const __u8 *key,
-	const void *message,
-	__u8 *out,
-	const size_t outlen)
-{
-
-	size_t sz;
-	int i;
-	SHA256_CTX *sha_ctx = &(ctx->sha256_ctx);
-
-	memcpy(ctx->k, key, KEY_SIZE);
-	memset((ctx->k) + KEY_SIZE, 0, SHA256_BLOCK_SIZE - KEY_SIZE);
-
-	for (i = 0; i < SHA256_BLOCK_SIZE; i++)
-	{
-		ctx->k_ipad[i] = 0x36 ^ ctx->k[i];
-		ctx->k_opad[i] = 0x5c ^ ctx->k[i];
-	}
-
-	// Perform HMAC algorithm: ( https://tools.ietf.org/html/rfc2104 )
-	//      `H(K XOR opad, H(K XOR ipad, data))`
-	sha256_init(sha_ctx);
-	sha256_update(sha_ctx, ctx->k_ipad, message);
-	sha256_final(sha_ctx, ctx->ihash);
-
-	sha256_init(sha_ctx);
-	sha256_update(sha_ctx, ctx->k_opad, ctx->ihash);
-	sha256_final(sha_ctx, ctx->ohash);
-
-	sz = (outlen > SHA256_DIGEST_SIZE) ? SHA256_DIGEST_SIZE : outlen;
-
-	memcpy(out, ctx->ohash, sz);
-}
-
-static inline int ip_is_fragment(struct iphdr *iph)
-{
-	return bpf_ntohs(iph->frag_off) & (IP_MF | IP_OFFSET);
-}
-
-static inline void *manage_ethernet(void *data, void *data_end)
-{
-	struct ethhdr *eth = data;
-
-	if (data + ETH_HLEN > data_end)
-	{
-		return NULL;
-	}
-
-	if (bpf_htons(eth->h_proto) != ETH_P_IP)
-	{
-		return NULL;
-	}
-
-	return data + ETH_HLEN;
-}
-
-static inline void *manage_ipv4(void *data, void *data_end, flow_t *fl)
-{
-
-	__u8 ip_len;
+	__u32 ip_len;
 	struct iphdr *ip_v4 = (struct iphdr *)data;
 
 	if (data + IPV4_MIN_HLEN > data_end)
@@ -254,205 +101,384 @@ static inline void *manage_ipv4(void *data, void *data_end, flow_t *fl)
 
 	ip_len = ip_v4->ihl << 2;
 
-	if (data + ip_len > data_end)
+	ip_len = ip_len & 0x3F;
+
+	ip_v4->tot_len = bpf_htons(bpf_ntohs(ip_v4->tot_len) - cut_len);
+
+	ip_v4->check = 0;
+
+	if (data + 60 > data_end) // TODO: correggo guardando se ci sono opzioni iterativamente
 		return NULL;
 
-	if (ip_is_fragment(ip_v4))
+	__s64 csum = bpf_csum_diff(0, 0, data, ip_len, 0);
+
+	if (csum < 0)
 	{
-		bpf_printk("Fragmented IP packet\n");
+		bpf_printk("csum < 0");
 		return NULL;
 	}
 
-	if (ip_v4->protocol != IPPROTO_TCP)
-	{
-		// bpf_printk("No TCP packet\n");
+	csum = csum_fold(csum);
+
+	ip_v4->check = csum;
+
+	data += ip_len;
+
+	struct tcphdr *tcp = (struct tcphdr *)data;
+
+	if (data + TCP_MIN_HLEN > data_end)
+		return NULL;
+
+	__u16 tcp_len = bpf_ntohl(ip_v4->tot_len) - ip_len;
+
+	tcp->check = 0;
+
+	if (data + tcp_len > data_end)
+		return NULL;
+
+	tcp_len = tcp_len & 0xFFF;
+
+	if(tcp_len > 0xFFF){
+		bpf_printk("data + tcp_len > data_end");
 		return NULL;
 	}
 
-	fl->src_addr = bpf_ntohl(ip_v4->saddr);
-	fl->dst_addr = bpf_ntohl(ip_v4->daddr);
+	__u32 csum_tcp = bpf_csum_diff(0, 0, (u32 *)tcp, tcp_len, 0);
 
-	//bpf_printk("IP src: %u\n", fl->src_addr);
-	//bpf_printk("IP dst: %u\n", fl->dst_addr);
+	if (csum_tcp < 0)
+	{
+		bpf_printk("csum_tcp < 0");
+		return NULL;
+	}
+
+	csum_tcp = csum_tcpudp_magic(ip_v4->saddr, ip_v4->daddr, tcp_len, IPPROTO_TCP, csum_tcp);
+
+	tcp->check = csum_tcp;
+
+	bpf_printk("tcp_hlen: %u", tcp_len);
 
 	return (void *)((long)data + (long)ip_len);
 }
+*/
 
-static inline __u8 manage_tcp(void *data, void *data_end, flow_t *fl)
+static __always_inline struct tlshdr* parse_tls(struct xdp_md *ctx, __u8 tls_offset)
 {
-	struct tcphdr *tcp = (struct tcphdr *)data;
-	__u16 tcp_hlen;
+	struct tlshdr *tls = NULL;
+	if(tls_offset == 54)
+		tls = ptr_at(ctx, 54, sizeof(struct tlshdr));
+	else if (tls_offset == 58)
+		tls = ptr_at(ctx, 58, sizeof(struct tlshdr));
+	else if (tls_offset == 62)
+		tls = ptr_at(ctx, 62, sizeof(struct tlshdr));
+	else if (tls_offset == 66)
+	    tls = ptr_at(ctx, 66, sizeof(struct tlshdr));
+	else if (tls_offset == 70)
+		tls = ptr_at(ctx, 70, sizeof(struct tlshdr));
+	else if (tls_offset == 74)
+		tls = ptr_at(ctx, 74, sizeof(struct tlshdr));
+	else if (tls_offset == 78)
+		tls = ptr_at(ctx, 78, sizeof(struct tlshdr));
+	else if (tls_offset == 82)
+		tls = ptr_at(ctx, 82, sizeof(struct tlshdr));
+	else if (tls_offset == 86)
+		tls = ptr_at(ctx, 86, sizeof(struct tlshdr));
+	else if (tls_offset == 90)
+		tls = ptr_at(ctx, 90, sizeof(struct tlshdr));
+	else if(tls_offset == 94)
+		tls = ptr_at(ctx, 94, sizeof(struct tlshdr));
+	else if(tls_offset == 98)
+		tls = ptr_at(ctx, 98, sizeof(struct tlshdr));
+	else if(tls_offset == 102)
+		tls = ptr_at(ctx, 102, sizeof(struct tlshdr));
+	else if(tls_offset == 106)
+		tls = ptr_at(ctx, 106, sizeof(struct tlshdr));
+	else if(tls_offset == 110)
+		tls = ptr_at(ctx, 110, sizeof(struct tlshdr));
+	else if(tls_offset == 114)
+		tls = ptr_at(ctx, 114, sizeof(struct tlshdr));
+	else if(tls_offset == 118)
+		tls = ptr_at(ctx, 118, sizeof(struct tlshdr));
+	else if(tls_offset == 122)
+		tls = ptr_at(ctx, 122, sizeof(struct tlshdr));
+	else if(tls_offset == 126)
+		tls = ptr_at(ctx, 126, sizeof(struct tlshdr));
+	else if(tls_offset == 130)
+		tls = ptr_at(ctx, 130, sizeof(struct tlshdr));
+	else if(tls_offset == 134)
+		tls = ptr_at(ctx, 134, sizeof(struct tlshdr));
+	else 
+		tls = NULL;
 
-	if (data + TCP_MIN_HLEN > data_end)
+	return tls;
+
+}
+
+static __always_inline int get_headers(struct xdp_md *ctx, struct hdr *hdr)
+{
+	__u8 ip_len;
+
+	hdr->eth = parse_ethernet(ctx);
+	if (!hdr->eth)
 		return 0;
 
-	fl->src_port = bpf_ntohs(tcp->source);
-	fl->dst_port = bpf_ntohs(tcp->dest);
-	//bpf_printk("TCP src port: %d\n", fl->src_port);
-	//bpf_printk("TCP dst port: %d\n", fl->dst_port);
+	hdr->ip = parse_ip(ctx);
+	if (!hdr->ip)
+		return 0;
+	ip_len = hdr->ip->ihl << 2;
+	ip_len = ip_len & 0x3F;
+
+	hdr->tcp = parse_tcp(ctx, ip_len);
+	if (!hdr->tcp)
+		return 0;
+
+	hdr->tls = parse_tls(ctx, ETH_HLEN + ip_len + hdr->tcp->doff * 4);
+	if (!hdr->tls)
+		return 0;
 
 	return 1;
-	// return data + tcp_hlen;
 }
 
-static inline int ptr_at(struct xdp_md *ctx, size_t offset, size_t len, void **out) {
-    void *start = (void *)(long)ctx->data;
-	void *end = (void *)(long)ctx->data_end;
-
-    if (start + offset + len > end) {
-        return -1; // Errore
-    }
-
-    *out = (void *)(start + offset);
-    return 0; // Successo
-}
-
-static inline void* ptr_at_1(struct xdp_md *ctx, size_t offset, size_t len) {
-	void *out;
-    void *start = (__u8*) ctx->data;
-	void *end = (__u8*) ctx->data_end;
-
-    if (start + offset + len > end) {
-        return NULL; // Errore
-    }
-	
-    out = (void *)(start + offset);
-    return out; // Successo
-}
-
-__attribute__((no_stack_protector))
-SEC("xdp") int xdp_parser_func(struct xdp_md *ctx)
+static __always_inline int is_dummy_packet(struct xdp_md *ctx, hmac_sha256_ctx *hmac_ctx, __u8 *dummy_packet_key)
 {
-	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	__u16 packet_len = ctx->data_end - ctx->data;
+	int hmac_message_offset = (packet_len - (MESSAGE_SIZE + SHA256_DIGEST_SIZE)) & 0xFFF;
 	__u8 hmac[SHA256_DIGEST_SIZE];
-	HMAC_SHA256_CTX *hmac_ctx;
-	struct so_event *e;
-	keys_t *keys;
-	struct flow fl;
-	__u32 packet_len;
-	int hmac_message_offset;
-	__u32 dummy_hmac_offset;
-	__u32 ctx_map_key = 0;
-	struct message *hmac_message;
-	struct message hmac_message_copy;
 
-	// l2 management
-	data = manage_ethernet(data, data_end);
-	if (!data)
-		return XDP_PASS;
-
-	// l3 management
-	data = manage_ipv4(data, data_end, &fl);
-	if (!data)
-		return XDP_PASS;
-
-	// l4 management
-	if (!manage_tcp(data, data_end, &fl))
-		return XDP_PASS;
-
-	// bpf_printk("tcp packet");
-	// retrieve secret key
-	keys = bpf_map_lookup_elem(&clients_map, &fl);
-
-	// check if ip is registered
-	if (!keys)
-	{
-		// bpf_printk("IP not registered\n");
-		return XDP_PASS;
-	}
-
-	bpf_printk("client registered");
-
-	hmac_ctx = bpf_map_lookup_elem(&ctx_map, &ctx_map_key);
-	if (!hmac_ctx)
-	{
-		bpf_printk("HMAC context not found\n");
-		return XDP_PASS;
-	}
-
-	packet_len = ctx->data_end - ctx->data;
-	//bpf_printk("ctx->data: %u", ctx->data);
-	//bpf_printk("ctx->data_end: %u", ctx->data_end);
-	data = (void *)(long)ctx->data;
-	
-	hmac_message_offset = packet_len - (MESSAGE_SIZE + SHA256_DIGEST_SIZE);
-
-	if(hmac_message_offset < 0)
-	{
-		bpf_printk("hmac_message_offset < 0");
-		return XDP_PASS;
-	}
-
-	bpf_printk("hmac_message_offset_1: %d", hmac_message_offset);
-
-	hmac_message_offset = hmac_message_offset & 0xFFF;
-
-	bpf_printk("packet_len: %u", packet_len);
-	//bpf_printk("data: %x", data);
-	//bpf_printk("hmac_message_offset: %x", hmac_message_offset);
-	//void* start = (void *)(long)data;
+	if (hmac_message_offset < 0)
+		return 0;
 
 	data = (void *)((long)data + (long)hmac_message_offset);
 
 	if (data + MESSAGE_SIZE > data_end)
-	{
-	    bpf_printk("data + MESSAGE_SIZE > data_end");
-		return XDP_PASS;
-	}
-	
-	/*
-	#pragma unroll
-	for (int i = 0; i < MESSAGE_SIZE; i++)
-	{
-		data = ptr_at_1(ctx, hmac_message_offset, i);
-		if (!data)
-		{
-			return XDP_PASS;
-		}
-		hmac_message[i] = ((__u8 *)data)[i];
-	}
-	
-	data = ptr_at_1(ctx, hmac_message_offset, MESSAGE_SIZE);
-	if (!data)
-	{
-		return XDP_PASS;
-	}
+		return 0;
 
-
-	hmac_message = data;
-
-	if(data + sizeof(struct message) > data_end)
-	{
-		return XDP_PASS;
-	}
-	*/
-	//memcpy(&hmac_message_copy, hmac_message, MESSAGE_SIZE);
-
-	hmac_sha256(hmac_ctx, keys->dummy_packet_key, data, hmac, SHA256_DIGEST_SIZE);
-
+	hmac_sha256(hmac_ctx, dummy_packet_key, data, hmac, SHA256_DIGEST_SIZE);
 
 	data += MESSAGE_SIZE;
 
 	if (data + SHA256_DIGEST_SIZE > data_end)
+		return 0;
+
+	if (memcmp(hmac, data, SHA256_DIGEST_SIZE) == 0)
+		return 1;
+
+	return 0;
+}
+
+static __always_inline __u16 get_padding_len(struct xdp_md *ctx, hmac_sha256_ctx *hmac_ctx, __u8 *padding_key)
+{
+	// PADDING MANAGEMENT (5*MESSAGE_SIZE bytes is the maximum padding size)
+
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	__u16 packet_len = ctx->data_end - ctx->data;
+	int hmac_message_offset = (packet_len - SHA256_DIGEST_SIZE) & 0xFFF;
+	void *message = (void *)((long)data + (long)hmac_message_offset);
+	void *hmac_candidate;
+	__u8 hmac[SHA256_DIGEST_SIZE];
+	__u8 i;
+
+#pragma unroll
+	for (i = 0; i < 5; i++)
 	{
-		bpf_printk("data + SHA256_DIGEST_SIZE > data_end");
+		hmac_message_offset -= MESSAGE_SIZE; // se l'unita minima del padding scende cambio la logica, la prima volta retrocedo di message, poi di "unit"
+
+		hmac_message_offset = hmac_message_offset & 0xFFF;
+
+		hmac_candidate = message;
+
+		message = ptr_at(ctx, hmac_message_offset, MESSAGE_SIZE);
+
+		if (!message)
+			break;
+
+		hmac_sha256(hmac_ctx, padding_key, message, hmac, SHA256_DIGEST_SIZE);
+
+		if (hmac_candidate + SHA256_DIGEST_SIZE > data_end)
+			break;
+
+		if (memcmp(hmac, hmac_candidate, SHA256_DIGEST_SIZE) != 0)
+			break;
+
+	}
+
+	return i * MESSAGE_SIZE;
+}
+
+static __always_inline int update_ipv4_len(struct iphdr *ip, struct xdp_md *ctx, int diff)
+{
+	void *data_end = (void *)(long)ctx->data_end;
+	__u16 ip_len = ip->ihl << 2;
+
+	ip->tot_len = bpf_htons(bpf_ntohs(ip->tot_len) - diff);
+
+	if ((void *)ip + MAX_IPH_SIZE > data_end)
+		return 0;
+
+	ip->check = 0;
+	__s64 csum = bpf_csum_diff(0, 0, (void *)ip, ip_len, 0);
+	if (csum < 0)
+		return 0;
+
+	csum = csum_fold(csum);
+	ip->check = csum;
+
+	return 1;
+}
+
+__attribute__((__always_inline__)) static inline __u16 csum_fold_helper(
+	__u64 csum)
+{
+	int i;
+#pragma unroll
+	for (i = 0; i < 4; i++)
+	{
+		if (csum >> 16)
+			csum = (csum & 0xffff) + (csum >> 16);
+	}
+	return ~csum;
+}
+
+static __always_inline int
+ipv4_l4_csum(void *data_start, int data_size, __u64 *csum, struct iphdr *iph, struct xdp_md *ctx)
+{
+	__u32 tmp = 0;
+	*csum = bpf_csum_diff(0, 0, data_start, data_size, *csum);
+	*csum = bpf_csum_diff(0, 0, &iph->saddr, sizeof(__be32), *csum);
+	*csum = bpf_csum_diff(0, 0, &iph->daddr, sizeof(__be32), *csum);
+	tmp = __builtin_bswap32((__u32)(iph->protocol));
+	*csum = bpf_csum_diff(0, 0, &tmp, sizeof(__u32), *csum);
+	tmp = __builtin_bswap32((__u32)(data_size));
+	*csum = bpf_csum_diff(0, 0, &tmp, sizeof(__u32), *csum);
+	*csum = csum_fold_helper(*csum);
+	return 1;
+}
+
+static __always_inline int update_tcp_checksum(struct tcphdr *tcp, struct iphdr *ip, struct xdp_md *ctx, int diff)
+{
+	void *data_end = (void *)(long)ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+	__u16 ip_len = ip->ihl << 2;
+	__u16 tcp_len = bpf_ntohs(ip->tot_len) - ip_len;
+	__u64 csum = 0;
+
+	tcp->check = 0;
+	tcp = parse_tcp(ctx, ip_len);
+	if (!tcp)
+		return 0;
+	if (data + MAX_ALLOWED_SIZE > data_end)
+		return 0;
+
+	//bpf_printk("ip_len: %u", ip_len);
+	if (tcp_len > MAX_ALLOWED_SIZE - 74)
+		return 0;
+
+	s64 csum_tcp = bpf_csum_diff(0, 0, tcp, tcp_len - tcp_len % 4, 0);
+	//bpf_printk("csum_tcp: %d", csum_tcp);
+
+	if (csum_tcp < 0)
+		return 0;
+
+	u8 last_bytes[4] = {0, 0, 0, 0};
+	void *a = (void *)((long)tcp + (long)(tcp_len - tcp_len % 4));
+	if (a + 4 > data_end)
+		return 0;
+	for (int i = 0; i < 4 && i < tcp_len % 4; i++)
+	{
+		last_bytes[i] = *(u8 *)(a + i);
+	}
+	csum_tcp = bpf_csum_diff(0, 0, last_bytes, 4, csum_tcp);
+	if (csum_tcp < 0)
+		return 0;
+
+	csum_tcp = csum_tcpudp_magic(ip->saddr, ip->daddr, tcp_len, IPPROTO_TCP, csum_tcp);
+
+	tcp->check = csum_tcp;
+
+	return 1;
+}
+
+SEC("xdp")
+int xdp_parser_func(struct xdp_md *ctx)
+{
+	struct hdr hdr;
+	flow_t fl;
+	__u32 ctx_map_key = 0;
+	hmac_sha256_ctx *hmac_ctx;
+	keys_t *keys;
+	__u32 packet_len = ctx->data_end - ctx->data;
+	__u64 csum = 0;
+
+	if (!get_headers(ctx, &hdr))
+		return XDP_PASS;
+
+	fl = (flow_t){
+		.src_addr = bpf_ntohl(hdr.ip->saddr),
+		.dst_addr = bpf_ntohl(hdr.ip->daddr),
+		.src_port = bpf_ntohs(hdr.tcp->source),
+		.dst_port = bpf_ntohs(hdr.tcp->dest)};
+
+	keys = bpf_map_lookup_elem(&clients_map, &fl);
+	if (!keys)
+	{
+		// bpf_printk("ip_src: %u, ip_dst: %u, port_src: %u, port_dts: %u", fl.src_addr, fl.dst_addr, bpf_ntohs(hdr.tcp->source), bpf_ntohs(hdr.tcp->dest));
 		return XDP_PASS;
 	}
 
+
 	
-	bpf_printk("hmac: ");
-	bpf_printk("%x%x%x%x%x%x%x%x%x%x", hmac[0], hmac[1], hmac[2], hmac[3], hmac[4], hmac[5], hmac[6], hmac[7], hmac[8], hmac[9]);
-	bpf_printk("%x%x%x%x%x%x%x%x%x%x", hmac[10], hmac[11], hmac[12], hmac[13], hmac[14], hmac[15], hmac[16], hmac[17], hmac[18], hmac[19]);
-	bpf_printk("%x%x%x%x%x%x%x%x%x%x", hmac[20], hmac[21], hmac[22], hmac[23], hmac[24], hmac[25], hmac[26], hmac[27], hmac[28], hmac[29]);
-	bpf_printk("%x%x%x%x%x%x%x%x%x%x", hmac[30], hmac[31]);
-	
-	if (memcmp(hmac, data, SHA256_DIGEST_SIZE) == 0)
-	{
-		bpf_printk("droppng");
+	bpf_printk("tls");
+	// bpf_printk("Packet len: %u", packet_len);
+
+	hmac_ctx = bpf_map_lookup_elem(&ctx_map, &ctx_map_key);
+	if (!hmac_ctx)
+		return XDP_PASS;
+
+	if (is_dummy_packet(ctx, hmac_ctx, &(keys->dummy_packet_key))) // ANZI CHE DROPPARE DOVREI TRASFORMARE IL PACCHETTO IN UN ACK E MANDARLO INDIETRO
 		return XDP_DROP;
+
+	// bpf_printk("Packet len: %u", packet_len);
+
+	__u16 padding_len = get_padding_len(ctx, hmac_ctx, &(keys->padding_key));
+	if (padding_len == 0)
+		return XDP_PASS;
+
+	// bpf_printk("ccc");
+
+	if (bpf_xdp_adjust_tail(ctx, MAX_ALLOWED_SIZE - packet_len) < 0)
+	{
+		bpf_printk("Error adjusting tail: %d", padding_len);
+		return XDP_PASS;
 	}
+
+	if (!get_headers(ctx, &hdr))
+		return XDP_ABORTED;
+
+	bpf_printk("aaa");
+
+	if (!update_ipv4_len(hdr.ip, ctx, padding_len))
+		return XDP_ABORTED;
+
+	bpf_printk("bbb");
 	
+	if((void*)hdr.tls + sizeof(struct tlshdr) > (void*)ctx->data_end)
+		return XDP_ABORTED;
+
+	hdr.tls->length = bpf_htons(bpf_ntohs(hdr.tls->length) - padding_len);
+	bpf_printk("tls_len: %x", hdr.tls->version);
+
+	if (!update_tcp_checksum(hdr.tcp, hdr.ip, ctx, padding_len))
+		return XDP_ABORTED;
+	
+	bpf_printk("ccc");
+
+	if (bpf_xdp_adjust_tail(ctx, -(MAX_ALLOWED_SIZE - packet_len + padding_len)) < 0)
+		return XDP_ABORTED;
+
+	bpf_printk("sssss");
+
 	return XDP_PASS;
 }
 
